@@ -1,0 +1,550 @@
+#include <memory>
+#include <vector>
+#include <map>
+#include <tuple>
+#include <cassert>
+#include <ziplib/ziplib.h>
+#include "inflate.hpp"
+
+using namespace ziplib;
+
+namespace {
+	// unz_file_info_interntal contain internal info about a file in zipfile
+	typedef struct unz_file_info64_internal_s
+	{
+		zip_file_info file_info;
+		char offset_curfile[8]; // relative offset of local header 8 bytes
+	} unz_file_info64_internal;
+
+	struct sparse_array {
+		typedef std::vector<char> value_type;
+		const value_type& insert( void* const ptr, const char* begin, const char* end );
+	private:
+		std::map<void*, std::shared_ptr<value_type> > _begin;
+		std::map<void*, std::weak_ptr  <value_type> > _end;
+
+		typename _begin::value_type
+		findBefore( void* ptr );
+
+		typename _begin::value_type
+		findAfter( void* ptr );
+	};
+
+	struct file_header_with_filename {
+		zip_local_file_header header;
+		const char* filename;
+	};
+
+	enum class entry_stage {
+		HEADER         = 1 << 0,
+		FIXED_HEADER   = 1 << 0 + 1 << 1,
+		DYNAMIC_HEADER = 1 << 0 + 1 << 2,
+		CONTENT        = 1 << 3
+	};
+
+	struct header {
+		file_header_with_filename* data();
+		const file_header_with_filename* data() const;
+
+		compression_method compression_method() const;
+		void read( zip_stream& stream, entry_stage& stage );
+		void reset();
+	private:
+		bool read_fixed( zip_stream& stream );
+		bool read_dynamic( zip_stream& stream );
+
+		void read_partial( zip_stream& stream, const char* begin, const char* end );
+		std::uint64_t variable_size();
+		std::vector<char> buffer;
+	};
+
+	struct content {
+		bool read( zip_stream& stream, entry_stage& stage );
+		void reset();
+	private:
+		std::unique_ptr<base_inflater> create_inflater();
+		void inflate( const char* begin, const char* end );
+
+		std::array<std::unique_ptr<base_inflater>, COMPRESSION_METHOD_COUNT> _inflaters;
+		std::uint64_t _left;
+	};
+
+	struct internal {
+		void put( zip_stream& stream );
+		template <typename It>
+		std::tuple<It, zip_local_file_header*> find_header( It begin, It end );
+	private:
+		void reset();
+		header  _header;
+		content _content;
+		entry_stage   _stage;
+		struct {
+			zip_data_descriptor ptr_begin;
+			zip_data_descriptor* ptr;
+
+			void reset() {
+				ptr = &ptr_begin;
+			}
+		} _footer;
+
+	};
+
+	internal& intern( zip_stream& strm ) {
+		return *static_cast<internal*>( strm.state );
+	}
+
+	bool isFilenameValid( zip_local_file_header& header ) {
+		auto& biggerHeader = *reinterpret_cast<file_header_with_filename*>( &header );
+
+		if( biggerHeader.header.partial.size_filename == 0 )
+			return true;
+
+		const auto end = biggerHeader.filename + biggerHeader.header.partial.size_filename;
+		auto termIt = std::find( biggerHeader.filename, end, '\0' );
+
+		if( termIt == end ) {
+			termIt = end - 1;
+			// Enforce proper termination
+			*termIt = '\0';
+			std::clog << "Filename was not terminated properly: " << biggerHeader.filename;
+		}
+
+		if( biggerHeader.filename[0] == '/' ) {
+			std::clog << "Ignored filename starting with '/': " << biggerHeader.filename;
+			return false;
+		}
+
+
+		decltype(biggerHeader.filename) it;
+		do {
+			// Find disallowed
+			it = std::find( biggerHeader.filename, termIt, '\\' );
+			*it = '/';
+		} while( it != termIt );
+
+		return true;
+	}
+
+	template <typename It>
+	bool isHeaderFitting( It begin, It end, zip_local_file_header& header ) {
+		return std::distance(begin, end) >= ZIP_LOCAL_FILE_HEADER_BYTES + header.partial.size_filename + header.partial.size_file_extra;
+	}
+
+	template <typename It>
+	bool isHeaderFitting( It begin, It end ) {
+		return std::distance(begin, end) >= ZIP_LOCAL_FILE_HEADER_BYTES;
+	}
+
+	enum class arch : std::uint8_t {
+		DOS = 0,
+		AMIGA = 1,
+		OPENVMS = 2,
+		UNIX = 3,
+		VM_CMS = 4,
+		ATARI_ST = 5,
+		HPFS = 6,
+		MAC = 7,
+		ZSYSTEM = 8,
+		CP_M = 9,
+		NTFS = 10,
+		MVS = 11,
+		VSE = 12,
+		ACORN = 13,
+		VFAT = 14,
+		ALT_MVS = 15,
+		BEOS = 16,
+		TANDEM = 17,
+		OS400 = 18,
+		OSX = 19
+	};
+
+	static const decltype(_left) UNKNOWN_SIZE = std::numeric_limits<decltype(_left)>::max();
+}
+
+typename sparse_array::_begin::value_type
+sparse_array::findBefore( void* ptr ) {
+	auto it = _end.find( ptr );
+
+	if( it == _end.end() )
+		return nullptr;
+
+	return *it;
+}
+
+typename sparse_array::_begin::value_type
+sparse_array::findAfter( void* ptr ) {
+	auto it = _begin.find( ptr );
+
+	if( it == _begin.end() )
+		return nullptr;
+
+	return it->lock();
+}
+
+// FIXME: We currently don't handle overlapping inserts
+const sparse_array::value_type&
+sparse_array::insert( void* const ptr, const char* begin, const char* end ) {
+	{ // Try to find entry before
+		auto sharedVector = findBefore( ptr );
+
+		if( sharedVector ) {
+			auto& beforeVector = *sharedVector;
+			// Append
+			beforeVector.insert( beforeVector.end(), begin, end );
+
+			return beforeVector;
+		}
+	}
+
+	{ // Try to find entry after
+		auto sharedVector = findAfter( ptr );
+
+		if( sharedVector ) {
+			auto& afterVector = *sharedVector;
+			// Prepend
+			afterVector.insert( afterVector.begin(), begin, end );
+			return afterVector;
+		}
+	}
+
+	// Need to create new sparse entry
+	auto beginVector = std::make_shared<typename _begin::value_type>( begin, end );
+	_begin.emplace( ptr, beginVector );
+	typename _end::value_type endVector = beginVector;
+	_end.emplace( ptr + std::distance(begin, end), beginVector );
+	return *beginVector;
+}
+
+void
+header::reset() {
+	buffer.clear();
+}
+
+std::uint64_t
+header::variable_size() {
+	assert( buffer.size() >= ZIP_LOCAL_FILE_HEADER_BYTES );
+	return data()->header.partial.size_filename
+	     + data()->header.partial.size_file_extra;
+}
+
+file_header_with_filename*
+header::data() {
+	return reinterpret_cast<file_header_with_filename*>( buffer.data() );
+}
+
+const file_header_with_filename*
+header::data() const {
+	return reinterpret_cast<const file_header_with_filename*>( buffer.data() );
+}
+
+compression_method
+header::compression_method() const {
+	return data()->header.partial.compression_method;
+}
+
+bool
+header::read_dynamic( zip_stream& stream ) {
+	const auto needs = variable_size() - buffer.size();
+	read_partial( stream, stream.next_in, stream.next_in + needs );
+
+	return buffer.size() != variable_size();
+}
+
+bool
+header::read_fixed( zip_stream& stream ) {
+	// Copy fixed part of header
+	const auto needs = ZIP_LOCAL_FILE_HEADER_BYTES - buffer.size();
+	read_partial( stream, stream.next_in, stream.next_in + needs );
+
+	return buffer.size() != ZIP_LOCAL_FILE_HEADER_BYTES;
+}
+
+void
+internal::reset() {
+	_header.reset();
+	_content.reset();
+	_stage = entry_stage::HEADER;
+}
+
+void
+header::read_partial( zip_stream& stream, const char* begin, const char* end ) {
+	auto distance = std::distance( begin, end );
+	distance = std::min( distance , stream.avail_in );
+	buffer.insert( buffer.end(), begin, begin + distance );
+
+	stream.next_in  += distance;
+	stream.avail_in -= distance;
+	stream.total_in += distance;
+}
+
+std::unique_ptr<base_inflater>
+internal::create_inflater( const compression_method method ) {
+	switch( method ) {
+	case compression_method::STORED:
+		return std::make_unique<inflater<STORED>>();
+#if 0
+	case SHRUNK:
+	case REDUCED_1:
+	case REDUCED_2:
+	case REDUCED_3:
+	case REDUCED_4:
+	case IMPLODED:
+	case TOKENIZING:
+#endif
+	case compression_method::DEFLATE:
+		return std::make_unique<inflater<compression_method::DEFLATE>>();
+	case compression_method::DEFLATE64:
+		return std::make_unique<inflater<compression_method::DEFLATE64>>();
+#if 0
+	case OLD_TERSE:
+	case BZIP2:
+	case LZMA:
+	case NEW_TERSE:
+	case PFS:
+	case WAVPACK:
+	case PPMD:
+#endif
+	default:
+		std::cerr << "Compression method '" << method << "' not supported." << std::endl;
+		throw std::runtime_error("BLAH");
+		break;
+	}
+}
+
+void
+content::inflate( const char* begin, const char* end ) {
+}
+
+void
+content::reset() {
+	_inflater = nullptr;
+	_left = 0;
+}
+
+void
+header::read( zip_stream& stream, entry_stage& stage ) {
+	// Try to make header full
+
+	if( stage == entry_stage::HEADER ) {
+		// No header found yet
+		static const char LOCAL_FILE_HEADER_SIGNATURE[4] = 0x504B0304;
+		// Need to find header first
+		const auto end = stream.next_in + stream.avail_in;
+		const auto it = std::search( stream.next_in, end, std::begin(LOCAL_FILE_HEADER_SIGNATURE), std::end(LOCAL_FILE_HEADER_SIGNATURE) );
+
+		{ // Save all bytes not used
+			_sparse.insert( stream.total_in, stream.next_in, it );
+			const auto distance = std::distance( stream.next_in, it );
+			stream.next_in  += distance;
+			stream.avail_in -= distance;
+			stream.total_in += distance;
+		}
+
+		if( it != end ) {
+			stage = entry_stage::FIXED_HEADER;
+		}
+	}
+
+	if( stage == entry_stage::FIXED_HEADER ) {
+		if( !read_fixed( stream ) )
+			stage = entry_stage::DYNAMIC_HEADER;
+	}
+
+	if( stage == entry_stage::DYNAMIC_HEADER ) {
+		if( !read_dynamic( stream ) )
+			stage = entry_stage::CONTENT;
+	}
+}
+
+bool
+content::read( zip_stream& stream, entry_stage& stage ) {
+	const compression_method method = _header.compression_method();
+	if( !_inflaters[compression_method_index(method)] )
+		_inflaters[compression_method_index(method)] = create_inflater( method );;
+
+	// After header we read content
+	if( _left == UNKNOWN_SIZE ) {
+		static const Bytef DESCRIPTOR_SIGNATURE[4] = 0x504B0708;
+		// Try to find (optional) descriptor signature
+		const auto end = stream.next_in + stream.avail_in;
+		auto it = std::search( stream.next_in, end,
+		                       std::begin(DESCRIPTOR_SIGNATURE), std::end(DESCRIPTOR_SIGNATURE) );
+
+		if( it == end ) {
+			// We do not know whether entry ends here. So copy to backbuffer.
+			_backbuffer.insert( _backbuffer.end(), stream.next_in, end );
+		} else {
+			// File entry may end here
+
+			// Skip signature
+			auto distance = SIZEN(DESCRIPTOR_SIGNATURE);
+			stream.next_in  += distance;
+			stream.avail_in -= distance;
+			stream.total_in += distance;
+
+			distance = std::min( stream.avail_in, _footer.left );
+			std::copy( stream.next_in, stream.next_in + distance, _footer.ptr );
+			stream.next_in  += distance;
+			stream.avail_in -= distance;
+			stream.total_in += distance;
+			_footer.ptr  += distance;
+			_footer.left -= distance;
+		}
+	} else {
+		// We have a known size
+		const auto distance = std::min( stream.avail_in, _left );
+		_inflater.inflate( stream.next_in, stream.next_in + distance );
+	}
+
+	if( !_left ) {
+		// Content is completely processed
+		return false;
+	}
+
+	return true;
+}
+
+bool
+internal::put( zip_stream& stream ) {
+
+	if( !stream.avail_in )
+		return true;
+
+	if( _stage & entry_stage::HEADER ) {
+		// Header needs to be read in
+		_header.read( stream, _stage );
+
+		if( _stage & entry_stage::CONTENT ) {
+			if( _header.data()->header.partial.flag & ZIP_FILE_SIZE_UNKNOWN ) {
+				_left = UNKNOWN_SIZE;
+				std::clog << "File entry does not contain a size. Trying to process." << std::endl;
+			} else
+				_left = _header.data()->header.partial.compressed_size;
+		}
+	}
+
+	if( _stage & entry_stage::CONTENT ) {
+		// Content needs to be read in
+		if( !_content.read( stream ) )
+			reset();
+	}
+}
+
+
+
+// Returns possible new location to search for header
+template <typename It>
+std::tuple<It, zip_local_file_header*>
+internal::find_header<It>( It begin, It end ) {
+
+
+
+	auto distance = std::distance(begin, end);
+
+	if( distance < 1 )
+		return begin;
+
+	--distance;
+	// Set to last element
+	auto last_match = begin + distance;
+
+	std::uint8_t failure_percent;
+	zip_local_file_header* header = nullptr;
+
+	do {
+
+
+
+		failure_percent = 0;
+		last_match = begin;
+
+		if( !isHeaderFitting( begin, end ) )
+			break;
+
+		header = reinterpret_cast<zip_local_file_header*>( begin );
+
+		if( !isHeaderFitting(begin, end, *header) )
+			break;
+
+		if( !isFilenameValid( *header ) ) {
+			failure_percent += 20;
+		}
+
+		begin += std::min( SIZE_N(header.signature), std::distance(begin, end) );
+	} while( begin != end && !header );
+
+	if( failure_percent >= 100 )
+		last_match += std::min( SIZE_N(header.signature), std::distance(last_match, end) );
+
+	return std::make_tuple( last_match, header );
+}
+
+/*
+  Set the current file of the zipfile to the first file.
+  return UNZ_OK if there is no problem
+*/
+extern int ZEXPORT unzGoToFirstFile (unzFile file)
+{
+    int err=UNZ_OK;
+    unz64_s* s;
+    if (file==NULL)
+        return UNZ_PARAMERROR;
+    s=(unz64_s*)file;
+    s->pos_in_central_dir = s->offset_central_dir;
+    s->num_file=0;
+    err=unz64local_GetCurrentFileInfoInternal(file,&s->cur_file_info,
+                                             &s->cur_file_info_internal,
+                                             NULL,0,NULL,0,NULL,0);
+    s->current_file_ok = (err == UNZ_OK);
+    return err;
+}
+
+int ZEXPORT
+zip_inflateInit( zip_streamp strm ) {
+	assert( strm );
+
+	// Set only fields written by us
+	strm->total_in  = 0;
+	strm->total_out = 0;
+	strm->state     = new internal();
+	return ZIP_OK;
+}
+
+int ZEXPORT
+zip_inflate( zip_streamp strm, int flush ) {
+	assert( strm );
+
+	intern(*strm).put( *strm );
+	return ZIP_OK;
+}
+
+/*
+  Set the current file of the zipfile to the next file.
+  return UNZ_OK if there is no problem
+  return UNZ_END_OF_LIST_OF_FILE if the actual file was the latest.
+*/
+extern int ZEXPORT unzGoToNextFile (unzFile  file)
+{
+    unz64_s* s;
+    int err;
+
+    if (file==NULL)
+        return UNZ_PARAMERROR;
+    s=(unz64_s*)file;
+    if (!s->current_file_ok)
+        return UNZ_END_OF_LIST_OF_FILE;
+    if (s->gi.number_entry != 0xffff)    /* 2^16 files overflow hack */
+      if (s->num_file+1==s->gi.number_entry)
+        return UNZ_END_OF_LIST_OF_FILE;
+
+    s->pos_in_central_dir += SIZECENTRALDIRITEM + s->cur_file_info.size_filename +
+            s->cur_file_info.size_file_extra + s->cur_file_info.size_file_comment ;
+    s->num_file++;
+    err = unz64local_GetCurrentFileInfoInternal(file,&s->cur_file_info,
+                                               &s->cur_file_info_internal,
+                                               NULL,0,NULL,0,NULL,0);
+    s->current_file_ok = (err == UNZ_OK);
+    return err;
+}
+
+

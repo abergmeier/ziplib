@@ -1,0 +1,77 @@
+/*
+ * inflate.hpp
+ *
+ *  Created on: Feb 9, 2013
+ *      Author: andreas
+ */
+
+#ifndef _ZIPLIB_INFLATE_HPP_
+#define _ZIPLIB_INFLATE_HPP_
+
+#include <cstdint>
+#include <ziplib/ziplib.h>
+
+namespace ziplib {
+	enum class compression_method : std::uint16_t {
+		STORED     = 0, // No compression
+		SHRUNK     = 1,
+		REDUCED_1  = 2, // with compression factor 1
+		REDUCED_2  = 3, // with compression factor 2
+		REDUCED_3  = 4, // with compression factor 3
+		REDUCED_4  = 5, // with compression factor 4
+		IMPLODED   = 6,
+		TOKENIZING = 7,
+		DEFLATE    = 8,
+		DEFLATE64  = 9,
+		OLD_TERSE  = 10, // PKWARE Data Compression Library Imploding (old IBM TERSE)
+		// RESERVED
+		BZIP2      = 12,
+		// RESERVED
+		LZMA       = 14, // (EFS)
+		// RESERVED
+		// RESERVED
+		// RESERVED
+		NEW_TERSE  = 18, // IBM TERSE (new)
+		PFS        = 19, // IBM LZ77 z Architecture
+		WAVPACK    = 97,
+		PPMD       = 98 // PPMd version I, Rev 1
+	};
+	
+	constexpr std::uint16_t compression_method_index( compression_method method ) {
+		return method == WAVPACK ?
+			20:
+			method == PPMD ?
+				21:
+				method;
+	}
+	
+	constexpr std::uint16_t COMPRESSION_METHOD_COUNT = compression_method_index( PPMD ) + 1;
+
+	enum class extra_id : std::uint16_t {
+		ZIP64          = 0x0001, // Zip64 extended information extra field
+		AV_INFO        = 0x0007,
+		OS2            = 0x0009,
+		NTFS           = 0x000a,
+		OPENVMS        = 0x000c,
+		UNIX           = 0x000d,
+		PATCH          = 0x000f,
+		PKCS_7         = 0x0014, //for X.509 Certificates
+		X509_FILE      = 0x0015, // X.509 Certificate ID and Signature for individual file
+		X509_CENTRAL   = 0x0016, // X.509 Certificate ID for Central Directory
+		STRONG_ENCRYPT = 0x0017,
+		RECORD_CTRL    = 0x0018, //Record Management Controls
+		PKCS_7_LIST    = 0x0019, // PKCS#7 Encryption Recipient Certificate List
+		IMB_ATTR       = 0x0065 // IBM S/390 (Z390), AS/400 (I400) attributes - uncompressed
+	};
+
+	namespace inflate {
+		struct base_inflater {
+		};
+
+		template <compression_method Method>
+		class inflater : base_inflater {
+		};
+	}
+}
+
+#endif // _ZIPLIB_INFLATE_HPP_

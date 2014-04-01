@@ -1,0 +1,42 @@
+/*
+ * inflate_deflate.cpp
+ *
+ *  Created on: Feb 9, 2013
+ *      Author: andreas
+ */
+
+#include <cstdint>
+#include "inflate.hpp"
+
+using namespace ziplib;
+using namespace ziplib::inflate;
+
+namespace {
+	const std::uint8_t ZIP_COMPRESSION_MASK       = 1 << 1 + 1 << 2;
+	enum class compression_strategy : std::uint8_t{
+		NORMAL     = 0,
+		MAX        = 1 << 1,
+		FAST       = 1 << 2,
+		SUPER_FAST = 1 << 1 + 1 << 2
+	};
+
+	compression_strategy strategy( const zip_local_file_header& header ) {
+		return header.partial.flag & ZIP_COMPRESSION_MASK;
+	}
+}
+
+template <>
+inflate<compression_method::DEFLATE>::inflate() {
+}
+
+namespace {
+	// The size will be in the corresponding 8 byte ZIP64 extended information
+	// extra field
+	const std::uint32_t USE_EXTENDED = 0xFFFFFFFF;
+}
+
+template <>
+inflate<compression_method::DEFLATE64>::inflate() {
+}
+
+
